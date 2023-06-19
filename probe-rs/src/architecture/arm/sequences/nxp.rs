@@ -6,6 +6,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::anyhow;
+
 use crate::{
     architecture::arm::{
         ap::{AccessPort, AccessPortError, ApAccess, GenericAp, MemoryAp, DRW, IDR, TAR},
@@ -568,5 +570,302 @@ impl ArmDebugSequence for MIMXRT11xx {
 
         interface.read_word_32(Dhcsr::get_mmio_address())?;
         Ok(())
+    }
+}
+
+/// Debug sequences for MIMXRT5xxS MCUs.
+///
+/// MCUs in this series do not have any on-board flash memory, and instead
+/// there is an unprogrammable boot ROM which attempts to find a suitable
+/// program from a variety of different sources. The entry point for
+/// application code therefore varies depending on the boot medium.
+///
+/// Because the system begins execution in the boot ROM, it isn't possible
+/// to use a standard reset vector catch on this platform. Instead, the series
+/// datasheet (section 60.3.4) describes the following protocol:
+///
+/// - Set a data watchpoint for a read from location 0x50002034.
+/// - Use SYSRESETREQ to reset the core and peripherals.
+/// - Wait 100ms to allow the boot ROM to re-enable debug.
+/// - Check whether the core is halted due to the watchpoint, by checking DHCSR.
+/// - If the core doesn't halt or halts for some reason other than the
+///   watchpoint, use the special debug mailbox protocol to exit the ISP mode
+///   and enter an infinite loop, at which point we can halt the MCU explicitly.
+/// - Clear the data watchpoint.
+///
+/// The debug mailbox protocol handles, among other things, recovering debug
+/// access when the part enters its ISP mode. ISP mode has debug disabled to
+/// prevent tampering with the system's security features. Datasheet
+/// section 60.3.1 describes the special debug recovery process.
+///
+/// This type's [`ArmDebugSequence`] implementation implements these two
+/// sequences to ensure that probe-rs can reset and halt the core.
+pub struct MIMXRT5xxS {}
+
+impl MIMXRT5xxS {
+    const DWT_COMP0: u64 = 0xE0001020;
+    const DWT_MASK0: u64 = 0xE0001024;
+    const DWT_FUNCTION0: u64 = 0xE0001028;
+    const BOOTROM_READ_SIGNAL_ADDR: u32 = 0x50002034;
+
+    /// Create a sequence handle for the MIMXRT5xxS.
+    pub fn create() -> Arc<dyn ArmDebugSequence> {
+        Arc::new(Self {})
+    }
+
+    /// Runtime validation of core type.
+    fn check_core_type(&self, core_type: crate::CoreType) -> Result<(), ArmError> {
+        if core_type != crate::CoreType::Armv8m {
+            // Caller has selected the wrong chip name, presumably.
+            return Err(ArmError::ArchitectureRequired(&["ARMv8"]));
+        }
+        Ok(())
+    }
+
+    /// Polls until DHCSR indicates that the core has halted in debug mode,
+    /// or until a timeout expires (in which case it returns a timeout error).
+    fn wait_for_debug_halt(&self, core: &mut dyn ArmProbe) -> Result<(), ArmError> {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_micros(500_000) {
+            let dhcsr = match core.read_word_32(Dhcsr::get_mmio_address()) {
+                Ok(val) => Dhcsr(val),
+                Err(ArmError::AccessPort {
+                    source:
+                        AccessPortError::RegisterRead { .. } | AccessPortError::RegisterWrite { .. },
+                    ..
+                }) => {
+                    // Some combinations of debug probe and target (in
+                    // particular, hs-probe and ATSAMD21) result in
+                    // register read errors while the target is
+                    // resetting.
+                    //
+                    // See here for more info: https://github.com/probe-rs/probe-rs/pull/1174#issuecomment-1275568493
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+
+            // We're hoping to find the core halted.
+            if dhcsr.s_halt() {
+                return Ok(());
+            }
+        }
+        Err(ArmError::Timeout)
+    }
+}
+
+impl ArmDebugSequence for MIMXRT5xxS {
+    /// Arranges for a catch on reset by setting a data watchpoint on the
+    /// special address documented in the platform datasheet, since the
+    /// main reset vector is in the system boot ROM rather than in user code.
+    fn reset_catch_set(
+        &self,
+        core: &mut dyn ArmProbe,
+        core_type: probe_rs_target::CoreType,
+        _debug_base: Option<u64>,
+    ) -> Result<(), ArmError> {
+        self.check_core_type(core_type)?;
+
+        tracing::debug!("set reset catch debug watchpoint for MIMXRT5xxS");
+
+        // TODO: Back up what's already in the DWT unit 0 registers before we
+        // clobber them, so we can restore in reset_watch_clear?
+
+        // Disable whatever the first data watchpoint is doing.
+        core.write_word_32(Self::DWT_FUNCTION0, 0)?;
+        core.flush()?;
+
+        // Read clears the flag for whether the watchpoint has matched.
+        // We don't actually care about the result, because if it was
+        // set then it was in response to something other than our goal here.
+        core.read_word_32(Self::DWT_FUNCTION0)?;
+
+        // Enable halting debug in DHCSR.
+        let mut dhcsr = Dhcsr(0);
+        dhcsr.set_c_debugen(true);
+        dhcsr.enable_write();
+        core.write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
+        core.flush()?;
+
+        // Halt on read from the special address given in the datasheet.
+        core.write_word_32(Self::DWT_COMP0, Self::BOOTROM_READ_SIGNAL_ADDR)?;
+        core.write_word_32(Self::DWT_MASK0, 0x00000000)?;
+        core.write_word_32(
+            Self::DWT_FUNCTION0,
+            0b0101, // Generate debug watchpoint event on read
+        )?;
+        core.flush()?;
+
+        tracing::debug!("debug watchpoint for MIMXRT5xxS is set");
+
+        Ok(())
+    }
+
+    fn reset_catch_clear(
+        &self,
+        core: &mut dyn ArmProbe,
+        core_type: probe_rs_target::CoreType,
+        _debug_base: Option<u64>,
+    ) -> Result<(), ArmError> {
+        self.check_core_type(core_type)?;
+
+        tracing::debug!("clear reset catch debug watchpoint for MIMXRT5xxS");
+
+        // Disable the zeroth data watchpoint.
+        core.write_word_32(Self::DWT_FUNCTION0, 0)?;
+        core.flush()?;
+
+        tracing::debug!("debug watchpoint for MIMXRT5xxS is cleared");
+
+        Ok(())
+    }
+
+    fn reset_system(
+        &self,
+        interface: &mut dyn ArmProbe,
+        core_type: crate::CoreType,
+        _: Option<u64>,
+    ) -> Result<(), ArmError> {
+        self.check_core_type(core_type)?;
+
+        tracing::debug!("system reset for MIMXRT5xxS");
+
+        let mut aircr = Aircr(0);
+        aircr.vectkey();
+        aircr.set_sysresetreq(true);
+        // The reset request happens so quickly that our write or flush will
+        // often appear to fail, so we ignore errors here.
+        interface
+            .write_word_32(Aircr::get_mmio_address(), aircr.into())
+            .ok();
+        interface.flush().ok();
+
+        // Datasheet requires that we wait 100ms to give the boot ROM time
+        // to enable debug.
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Now we'll poll DHCSR for a while in the hope that the core hits
+        // our data watchpoint and gets halted. This is the happy path for
+        // when the system manages to boot into valid application code that
+        // leaves debug enabled.
+        match self.wait_for_debug_halt(interface) {
+            Ok(_) => {
+                // We've been successful only if our watchpoint indicates that
+                // it has matched at least once since we set it up.
+                let v = (interface.read_word_32(Self::DWT_FUNCTION0)? >> 24) & 0b1;
+                if v == 1 {
+                    return Ok(());
+                }
+                tracing::trace!("MIMXRT5xxS core halted, but not due to our watchpoint; attempting debug mailbox reset");
+            }
+            Err(ArmError::Timeout) => {
+                tracing::trace!("MIMXRT5xxS core did not halt; attempting debug mailbox reset");
+            }
+            Err(e) => return Err(e),
+        }
+
+        // If we fall out here then the core didn't end up in a debug-halted
+        // state, which might be because it's entered ISP mode with debugging
+        // disabled.
+        let mut mbox = MIMXRT5xxSDebugMailbox::new(interface);
+        mbox.request_resync()?;
+        mbox.start_dm_ap()?;
+        mbox.start_debug_session()?;
+
+        // The core should now be spinning in an infinite loop, and so we'll
+        // halt it here so that the caller can do programming or whatever else
+        // it was intending to do.
+        tracing::trace!("halting MIMXRT5xxS core after mailbox reset");
+        let mut dhcsr = Dhcsr(0);
+        dhcsr.set_c_halt(true);
+        dhcsr.set_c_debugen(true);
+        dhcsr.enable_write();
+        interface.write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
+        interface.flush()?;
+
+        tracing::trace!("waiting for MIMXRT5xxS core to halt");
+        self.wait_for_debug_halt(interface)
+    }
+}
+
+/// Interface to the MIMXRT5xxS debug mailbox, which allows reacquiring debug
+/// access to the system when it's running boot ROM code, which normally
+/// blocks debug access.
+struct MIMXRT5xxSDebugMailbox<'a> {
+    interface: &'a mut dyn ArmProbe,
+}
+
+impl<'a> MIMXRT5xxSDebugMailbox<'a> {
+    const REG_BASE: u64 = 0x4010F000;
+    const REG_CSW: u64 = Self::REG_BASE;
+    const REG_REQUEST: u64 = Self::REG_BASE + 4;
+    const REG_RETURN: u64 = Self::REG_BASE + 8;
+
+    fn new(interface: &'a mut dyn ArmProbe) -> Self {
+        Self { interface }
+    }
+
+    fn request_resync(&mut self) -> Result<(), ArmError> {
+        self.raw_csw_write(
+            0b1, // RESYNCH_REQ
+        )?;
+
+        // We need to poll CSW until it returns zero to signal that the
+        // resync has completed.
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_micros(500_000) {
+            let v = match self.raw_csw_read() {
+                Ok(v) => v,
+                Err(_) => continue, // errors expected for a while after resync
+            };
+            if v == 0 {
+                return Ok(());
+            }
+        }
+        Err(ArmError::Other(anyhow!("Debug mailbox resync timeout")))
+    }
+
+    fn start_dm_ap(&mut self) -> Result<(), ArmError> {
+        self.raw_request_write(0x00000001)?;
+        let status = self.raw_response_read()? & 0xffff;
+        if status != 0x0000 {
+            return Err(ArmError::Other(anyhow!(
+                "Start DM-AP failed: {:08x}",
+                status
+            )));
+        }
+        Ok(())
+    }
+
+    fn start_debug_session(&mut self) -> Result<(), ArmError> {
+        self.raw_request_write(0x00000007)?;
+        let status = self.raw_response_read()? & 0xffff;
+        if status != 0x0000 {
+            return Err(ArmError::Other(anyhow!(
+                "DM-AP Start Debug Session failed: {:08x}",
+                status
+            )));
+        }
+        Ok(())
+    }
+
+    fn raw_csw_write(&mut self, v: u32) -> Result<(), ArmError> {
+        self.interface.write_word_32(Self::REG_CSW, v)?;
+        self.interface.flush()?;
+        Ok(())
+    }
+
+    fn raw_csw_read(&mut self) -> Result<u32, ArmError> {
+        self.interface.read_word_32(Self::REG_CSW)
+    }
+
+    fn raw_request_write(&mut self, v: u32) -> Result<(), ArmError> {
+        self.interface.write_word_32(Self::REG_REQUEST, v)?;
+        self.interface.flush()?;
+        Ok(())
+    }
+
+    fn raw_response_read(&mut self) -> Result<u32, ArmError> {
+        self.interface.read_word_32(Self::REG_RETURN)
     }
 }
