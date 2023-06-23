@@ -76,6 +76,11 @@ variants:
   flash_algorithms:
   - mimxrt5xx_evk_flexspi
   - mimxrt5xx_evk_flexspi_s
+  rtt_scan_ranges: [
+    # A full scan of all 5MiB of RAM takes a very long time on typical probes,
+    # so RTT scanning is disabled for this target. Use a _SEGGER_RTT symbol in
+    # your executable to enable RTT.
+  ]
 flash_algorithms:
 - name: mimxrt5xx_evk_flexspi
   description: MIMXRT5XX FLEXSPI

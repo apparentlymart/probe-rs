@@ -49,14 +49,14 @@ pub fn run(
 
     let rtt_config = rtt::RttConfig::default();
 
-    let memory_map = session.target().memory_map.clone();
+    let scan_ranges = session.target().rtt_scan_regions.clone();
 
     let mut core = session.core(0)?;
     core.reset()?;
 
     let mut rtta = match rtt::attach_to_rtt(
         &mut core,
-        &memory_map,
+        &scan_ranges,
         Path::new(path),
         &rtt_config,
         timestamp_offset,
