@@ -15,6 +15,7 @@ use crate::{
         dp::{Abort, Ctrl, DpAccess, Select, DPIDR},
         memory::{adi_v5_memory_interface::ArmProbe, CoresightComponent},
         ApAddress, ArmCommunicationInterface, ArmError, ArmProbeInterface, DapAccess, DpAddress,
+        Pins,
     },
     core::MemoryMappedRegister,
 };
@@ -607,6 +608,8 @@ impl MIMXRT5xxS {
     const DWT_COMP0: u64 = 0xE0001020;
     const DWT_FUNCTION0: u64 = 0xE0001028;
     const SYSTEM_STICK_CALIB_ADDR: u32 = 0x50002034;
+    const FLEXSPI_NOR_FLASH_HEADER_ADDR: u64 = 0x08000400;
+    const FLEXSPI_NOR_FLASH_HEADER_MAGIC: u32 = 0x42464346;
 
     /// Create a sequence handle for the MIMXRT5xxS.
     pub fn create() -> Arc<dyn ArmDebugSequence> {
@@ -637,7 +640,15 @@ impl MIMXRT5xxS {
         // Give bootloader time to do what it needs to do
         std::thread::sleep(Duration::from_micros(100_000));
 
-        self.enable_debug_mailbox(probe.get_arm_communication_interface()?)?;
+        let ap: MemoryAp = probe.ap();
+        let dp = ap.ap_address().dp;
+        let start = Instant::now();
+        while !self.csw_debug_ready(probe.get_arm_communication_interface()?, ap)?
+            && start.elapsed() < Duration::from_micros(300_000)
+        {
+            // Wait for either condition
+        }
+        let enabled_mailbox = self.enable_debug_mailbox(probe.get_arm_communication_interface()?, dp, ap)?;
 
         // Halt the core in case it didn't stop at a breakpiont.
         tracing::debug!("halting MIMXRT5xxS Cortex-M33 core");
@@ -648,38 +659,90 @@ impl MIMXRT5xxS {
         probe.write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
         probe.flush()?;
 
+        if enabled_mailbox {
+            // We'll double-check now to make sure we're in a reasonable state.
+            if !self.csw_debug_ready(probe.get_arm_communication_interface()?, ap)? {
+                tracing::warn!("MIMXRT5xxS is still not ready to debug, even after using DebugMailbox to activate session");
+            }
+        }
+
         // Clear watch point
         probe.write_word_32(Self::DWT_COMP0, 0x0)?;
         probe.write_word_32(Self::DWT_FUNCTION0, 0x0)?;
         probe.flush()?;
         tracing::debug!("cleared data watchpoint for MIMXRT5xxS reset");
 
+        // As a heuristic for whether startup seems to have succeeded, we'll
+        // probe the location where the SPI Flash configuration block would
+        // be and see if it starts with the expected magic number.
+        // This is just a logged warning rather than an error (as long as we
+        // manage to read _something_) because the user might not actually be
+        // intending to use the FlexSPI0 flash device for boot.
+        let probed = probe.read_word_32(Self::FLEXSPI_NOR_FLASH_HEADER_ADDR)?;
+        if probed != Self::FLEXSPI_NOR_FLASH_HEADER_MAGIC {
+            tracing::warn!(
+                "FlexSPI0 NOR flash config block starts with {:#010x} (valid blocks start with {:#010x})",
+                probed, Self::FLEXSPI_NOR_FLASH_HEADER_MAGIC,
+            );
+        } else {
+            tracing::debug!("FlexSPI0 NOR flash config block starts with {:#010x}, as expected", probed);
+        }
+
         Ok(())
+    }
+
+    fn reset_flash(&self, interface: &mut dyn ArmProbe) -> Result<(), ArmError> {
+        tracing::debug!("MIMXRT595S-EVK FlexSPI flash reset (pulse PIO4_5)");
+
+        // FIXME: We do this by twiddling PIO4_5, which is where the flash
+        // reset pin is connected on MIMX595-EVK, but this code should not
+        // make any assumptions about the evaluation board; how can we
+        // generalize this so that the reset is configurable?
+        interface.write_word_32(0x40001044, 1 << 24)?; // enable GPIO clock
+        interface.write_word_32(0x40000074, 1 << 24)?; // take GPIO out of reset
+        interface.write_word_32(0x40004214, 0x130)?; // full drive and pullup
+        interface.write_word_32(0x40102010, 1 << 5)?; // PIO4_5 is an output
+        interface.write_word_32(0x40103214, 0)?; // PIO4_5 is driven low
+        std::thread::sleep(Duration::from_millis(100));
+
+        interface.write_word_32(0x40102010, 0)?; // PIO4_5 is an input
+        interface.flush()?;
+        std::thread::sleep(Duration::from_millis(100));
+
+        Ok(())
+    }
+
+    fn csw_debug_ready(
+        &self,
+        interface: &mut ArmCommunicationInterface<Initialized>,
+        ap: MemoryAp,
+    ) -> Result<bool, ArmError> {
+        let csw = interface.read_raw_ap_register(ap.ap_address(), 0x00)?;
+
+        Ok(csw & 0x40 != 0)
     }
 
     /// A port of the "EnableDebugMailbox" sequence from the CMSIS Pack for
     /// this chip.
+    ///
+    /// Returns true if the debug mailbox was successfully enabled, or
+    /// false if enabling the debug mailbox isn't necessary. Returns an error
+    /// if it was necessary but unsuccessful.
     fn enable_debug_mailbox(
         &self,
         interface: &mut ArmCommunicationInterface<Initialized>,
-    ) -> Result<(), ArmError> {
+        dp: DpAddress,
+        mem_ap: MemoryAp,
+    ) -> Result<bool, ArmError> {
         // Check AHB-AP CSW DbgStatus to decide if need enable DebugMailbox
-        let ap_addr = ApAddress {
-            dp: DpAddress::Default,
-            ap: 0,
-        };
-        if (interface.read_raw_ap_register(ap_addr, 0x0)? & 0x40) == 0 {
+        if self.csw_debug_ready(interface, mem_ap)? {
             tracing::debug!("don't need to enable MIMXRT5xxS DebugMailbox");
-            return Ok(());
+            return Ok(false);
         }
 
         tracing::debug!("enabling MIMXRT5xxS DebugMailbox");
 
-        // For the rest of this work we'll use the debugger mailbox registers.
-        let ap_addr = ApAddress {
-            dp: DpAddress::Default,
-            ap: 2,
-        };
+        let ap_addr = ApAddress { dp, ap: 2 };
 
         // CMSIS Pack implementation reads APIDR and DPIDR and passes each
         // to the "Message" function, but otherwise does nothing with those
@@ -697,7 +760,7 @@ impl MIMXRT5xxS {
 
         tracing::debug!("entered MIMXRT5xxS debug session");
 
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -713,6 +776,9 @@ impl ArmDebugSequence for MIMXRT5xxS {
 
         tracing::debug!("MIMXRT5xxS debug port start");
 
+        // Clear WDATAERR, STICKYORUN, STICKYCMP, and STICKYERR bits of CTRL/STAT Register by write to ABORT register
+        interface.write_raw_dp_register(dp, SW_DP_ABORT, 0x0000001E)?;
+
         // Switch to DP Register Bank 0
         interface.write_raw_dp_register(dp, DP_SELECT, 0x00000000)?;
 
@@ -720,6 +786,8 @@ impl ArmDebugSequence for MIMXRT5xxS {
         let powered_down =
             (interface.read_raw_dp_register(dp, DP_CTRL_STAT)? & 0xA0000000) != 0xA0000000;
         if powered_down {
+            tracing::debug!("MIMXRT5xxS is powered down, so requesting power-up");
+
             // Request Debug/System Power-Up
             interface.write_raw_dp_register(dp, DP_CTRL_STAT, 0x50000000)?;
 
@@ -730,20 +798,26 @@ impl ArmDebugSequence for MIMXRT5xxS {
                     return Err(ArmError::Timeout);
                 }
             }
-
-            // SWD Specific Part of sequence
-            // TODO: Should we skip this if we're not using SWD? How?
-            // CMSIS Pack code uses: <control if="(__protocol &amp; 0xFFFF) == 2">
-            {
-                // Init AP Transfer Mode, Transaction Counter, and Lane Mask (Normal Transfer Mode, Include all Byte Lanes)
-                interface.write_raw_dp_register(dp, DP_CTRL_STAT, 0x50000F00)?;
-
-                // Clear WDATAERR, STICKYORUN, STICKYCMP, and STICKYERR bits of CTRL/STAT Register by write to ABORT register
-                interface.write_raw_dp_register(dp, SW_DP_ABORT, 0x0000001E)?;
-
-                self.enable_debug_mailbox(interface)?;
-            }
+        } else {
+            tracing::trace!("MIMXRT5xxS debug port is already powered");
         }
+
+        // SWD Specific Part of sequence
+        // TODO: Should we skip this if we're not using SWD? How?
+        // CMSIS Pack code uses: <control if="(__protocol &amp; 0xFFFF) == 2">
+        {
+            // Init AP Transfer Mode, Transaction Counter, and Lane Mask (Normal Transfer Mode, Include all Byte Lanes)
+            interface.write_raw_dp_register(dp, DP_CTRL_STAT, 0x50000F00)?;
+
+            // Clear WDATAERR, STICKYORUN, STICKYCMP, and STICKYERR bits of CTRL/STAT Register by write to ABORT register
+            interface.write_raw_dp_register(dp, SW_DP_ABORT, 0x0000001E)?;
+
+            let ap = ApAddress { dp, ap: 0 };
+            let mem_ap = MemoryAp::new(ap);
+            self.enable_debug_mailbox(interface, dp, mem_ap)?;
+        }
+
+        tracing::trace!("MIMXRT5xxS debug port start was successful");
 
         Ok(())
     }
@@ -773,6 +847,9 @@ impl ArmDebugSequence for MIMXRT5xxS {
         probe.write_word_32(Demcr::get_mmio_address(), demcr.into())?;
         probe.flush()?;
 
+        // Reset the flash peripheral on FlexSPI0, if any.
+        self.reset_flash(probe)?;
+
         // Set watch point at SYSTEM_STICK_CALIB access
         probe.write_word_32(Self::DWT_COMP0, Self::SYSTEM_STICK_CALIB_ADDR)?;
         probe.write_word_32(Self::DWT_FUNCTION0, 0x00000814)?;
@@ -790,7 +867,34 @@ impl ArmDebugSequence for MIMXRT5xxS {
             .ok();
         probe.flush().ok();
 
+        tracing::debug!("MIMXRT5xxS reset system was successful; waiting for halt after reset");
+
         self.wait_for_stop_after_reset(probe)
+    }
+
+    fn reset_hardware_deassert(&self, memory: &mut dyn ArmProbe) -> Result<(), ArmError> {
+        tracing::trace!("MIMXRT5xxS reset hardware deassert");
+        let n_reset = Pins(0x80).0 as u32;
+
+        let can_read_pins = memory.swj_pins(0, n_reset, 0)? != 0xffff_ffff;
+
+        thread::sleep(Duration::from_millis(50));
+
+        let mut assert_n_reset = || memory.swj_pins(n_reset, n_reset, 0);
+
+        if can_read_pins {
+            let start = Instant::now();
+            let timeout_occured = || start.elapsed() > Duration::from_secs(1);
+
+            while assert_n_reset()? & n_reset == 0 || !timeout_occured() {
+                // Block until either condition passes
+            }
+        } else {
+            assert_n_reset()?;
+            thread::sleep(Duration::from_micros(100000));
+        }
+
+        Ok(())
     }
 
     // "ResetHardware" intentionally omitted because the default implementation
