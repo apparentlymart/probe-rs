@@ -186,7 +186,12 @@ impl Session {
 
         // For each core, setup debugging
         for core in &cores {
-            core.enable_arm_debug(&mut *interface)?;
+            let enable_span = tracing::debug_span!("enable_arm_debug", id = core.id).entered();
+            core.enable_arm_debug(&mut *interface).map_err(|e| {
+                tracing::error!("failed to enable ARM debug for core {}: {}", core.id, e);
+                e
+            })?;
+            drop(enable_span);
         }
 
         if attach_method == AttachMethod::UnderReset {

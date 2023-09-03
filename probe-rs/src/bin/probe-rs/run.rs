@@ -3,6 +3,7 @@ use crate::util::flash::run_flash_download;
 use crate::util::rtt;
 use anyhow::{Context, Result};
 use probe_rs::flashing::FileDownloadError;
+use probe_rs::MemoryInterface;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -53,19 +54,34 @@ pub fn run(
 
     let mut core = session.core(0)?;
     core.reset()?;
+    core.run()?;
 
-    let mut rtta = match rtt::attach_to_rtt(
-        &mut core,
-        &scan_ranges,
-        Path::new(path),
-        &rtt_config,
-        timestamp_offset,
-    ) {
-        Ok(target_rtt) => Some(target_rtt),
-        Err(error) => {
-            log::error!("{:?} Continuing without RTT... ", error);
-            None
-        }
+    let mut rtt_attempts = 0;
+    let mut rtta = loop {
+        match rtt::attach_to_rtt(
+            &mut core,
+            &scan_ranges,
+            Path::new(path),
+            &rtt_config,
+            timestamp_offset,
+        ) {
+            Ok(target_rtt) => break Some(target_rtt),
+            Err(error) => {
+                if rtt_attempts < 2 {
+                    rtt_attempts += 1;
+                    log::debug!(
+                        "RTT attach attempt {:?} failed (will retry): {}",
+                        rtt_attempts,
+                        error
+                    );
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
+                } else {
+                    log::error!("{:?} Continuing without RTT... ", error);
+                    break None;
+                }
+            }
+        };
     };
 
     if let Some(rtta) = &mut rtta {

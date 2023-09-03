@@ -318,7 +318,10 @@ fn armv8a_core_start(
 fn cortex_m_core_start(core: &mut dyn ArmProbe) -> Result<(), ArmError> {
     use crate::architecture::arm::core::armv7m::Dhcsr;
 
-    let current_dhcsr = Dhcsr(core.read_word_32(Dhcsr::get_mmio_address())?);
+    let current_dhcsr = Dhcsr(core.read_word_32(Dhcsr::get_mmio_address()).map_err(|e| {
+        tracing::error!("failed to read DHCSR: {}", e);
+        e
+    })?);
 
     // Note: Manual addition for debugging, not part of the original DebugCoreStart function
     if current_dhcsr.c_debugen() {
@@ -577,7 +580,10 @@ pub trait ArmDebugSequence: Send + Sync {
         debug_base: Option<u64>,
         cti_base: Option<u64>,
     ) -> Result<(), ArmError> {
-        let mut core = interface.memory_interface(core_ap)?;
+        let mut core = interface.memory_interface(core_ap).map_err(|e| {
+            tracing::error!("failed to obtain memory interface: {}", e);
+            e
+        })?;
 
         // Dispatch based on core type (Cortex-A vs M)
         match core_type {
@@ -588,6 +594,10 @@ pub trait ArmDebugSequence: Send + Sync {
             }
             _ => panic!("Logic inconsistency bug - non ARM core type passed {core_type:?}"),
         }
+        .map_err(|e| {
+            tracing::error!("failed to start core: {}", e);
+            e
+        })
     }
 
     /// Configure the target to stop code execution after a reset. After this, the core will halt when it comes

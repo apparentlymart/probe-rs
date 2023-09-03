@@ -459,6 +459,7 @@ impl<'interface> ArmCommunicationInterface<Initialized> {
         &'interface mut self,
         access_port: MemoryAp,
     ) -> Result<Box<dyn ArmProbe + 'interface>, ArmError> {
+        let _span = tracing::debug_span!("memory_interface").entered();
         let info = self
             .ap_information(access_port)?
             .ok_or_else(|| ArmError::ApDoesNotExist(access_port.ap_address()))?;
